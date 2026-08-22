@@ -1,5 +1,4 @@
-"""
-Moteur d'estimation de Pain (Delta Infinity) — version étendue.
+""" Moteur d'estimation de Pain (Delta Infinity) — version étendue.
 
 Couvre les méthodes QUANTITATIVES du catalogue Pain :
   mco, mcg, logit, probit, gmm (via IV/2SLS), panel (fixe/aléatoire), ardl, sem
@@ -172,6 +171,14 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
     - signale (sans les supprimer automatiquement) les valeurs aberrantes
       au-delà de 3 écarts-types, pour rester transparent plutôt que de
       décider seul de jeter une observation légitime
+
+    Par convention, colonnes_valeurs[0] est TOUJOURS la variable dépendante
+    (c'est comme ça que le site l'envoie : [dep, *independantes]). On ne la
+    rejette jamais pour cause de trop de données manquantes — la rejeter
+    revient à rendre toute estimation impossible, ce qui est pire que
+    perdre quelques lignes. Seules les variables explicatives peuvent être
+    écartées si elles sont trop incomplètes ; le nettoyage final continue
+    de toute façon à ne garder que les lignes où la dépendante est connue.
     """
     df = pd.DataFrame(data)
     if periode_col not in df.columns:
@@ -182,9 +189,11 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
             raise ValueError(f"Colonne manquante : {c}")
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    dependante = colonnes_valeurs[0]
+    autres = colonnes_valeurs[1:]
     taux_manquant = df[colonnes_valeurs].isna().mean()
-    colonnes_ok = [c for c in colonnes_valeurs if taux_manquant[c] <= seuil_manquant]
-    colonnes_rejetees = [c for c in colonnes_valeurs if c not in colonnes_ok]
+    colonnes_ok = [dependante] + [c for c in autres if taux_manquant[c] <= seuil_manquant]
+    colonnes_rejetees = [c for c in autres if c not in colonnes_ok]
 
     df[colonnes_ok] = df[colonnes_ok].interpolate(method="linear", limit=1, limit_direction="both")
     df_propre = df.dropna(subset=colonnes_ok)
