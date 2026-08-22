@@ -163,7 +163,7 @@ def _sem(data, modele_sem):
     }
 
 
-def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=0.4):
+def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=0.4, colonnes_protegees=None):
     """Nettoyage déterministe et réutilisable (pas généré à la volée) :
     - aligne les séries sur la période commune
     - interpole les valeurs manquantes isolées (au maximum 1 an d'écart),
@@ -172,13 +172,11 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
       au-delà de 3 écarts-types, pour rester transparent plutôt que de
       décider seul de jeter une observation légitime
 
-    Par convention, colonnes_valeurs[0] est TOUJOURS la variable dépendante
-    (c'est comme ça que le site l'envoie : [dep, *independantes]). On ne la
-    rejette jamais pour cause de trop de données manquantes — la rejeter
-    revient à rendre toute estimation impossible, ce qui est pire que
-    perdre quelques lignes. Seules les variables explicatives peuvent être
-    écartées si elles sont trop incomplètes ; le nettoyage final continue
-    de toute façon à ne garder que les lignes où la dépendante est connue.
+    colonnes_protegees (dépendante + variable(s) d'intérêt) ne sont JAMAIS
+    rejetées pour cause de trop de données manquantes — les rejeter rend
+    l'estimation soit impossible (dépendante) soit vide de sens par rapport
+    à l'hypothèse testée (variable d'intérêt). Seules les variables de
+    contrôle peuvent être écartées si trop incomplètes.
     """
     df = pd.DataFrame(data)
     if periode_col not in df.columns:
@@ -189,11 +187,15 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
             raise ValueError(f"Colonne manquante : {c}")
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    dependante = colonnes_valeurs[0]
-    autres = colonnes_valeurs[1:]
+    protegees = set(colonnes_protegees or [colonnes_valeurs[0]])
+    controles = [c for c in colonnes_valeurs if c not in protegees]
     taux_manquant = df[colonnes_valeurs].isna().mean()
-    colonnes_ok = [dependante] + [c for c in autres if taux_manquant[c] <= seuil_manquant]
-    colonnes_rejetees = [c for c in autres if c not in colonnes_ok]
+    colonnes_ok = [c for c in colonnes_valeurs if c in protegees] + [c for c in controles if taux_manquant[c] <= seuil_manquant]
+    colonnes_rejetees = [c for c in controles if c not in colonnes_ok]
+    # Taux de manquant des colonnes protégées, même non rejetées : utile
+    # pour que le site propose une stratégie de repli si la variable
+    # d'intérêt elle-même est trop trouée (dummy, changement de modèle...).
+    taux_protegees = {c: round(float(taux_manquant[c]), 3) for c in protegees if c in taux_manquant}
 
     df[colonnes_ok] = df[colonnes_ok].interpolate(method="linear", limit=1, limit_direction="both")
     df_propre = df.dropna(subset=colonnes_ok)
@@ -209,6 +211,7 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
         "data": df_propre.to_dict("records"),
         "n_avant": len(df), "n_apres": len(df_propre),
         "colonnes_rejetees": colonnes_rejetees,
+        "taux_manquant_variables_protegees": taux_protegees,
         "valeurs_aberrantes_signalees": aberrantes,
     }
 
@@ -217,7 +220,7 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
 def nettoyer():
     try:
         p = request.get_json(force=True)
-        resultat = _nettoyer_serie(p.get("data", []), p.get("colonnes", []), p.get("periode_col", "annee"), p.get("seuil_manquant", 0.4))
+        resultat = _nettoyer_serie(p.get("data", []), p.get("colonnes", []), p.get("periode_col", "annee"), p.get("seuil_manquant", 0.4), p.get("colonnes_protegees"))
         return jsonify(resultat)
     except Exception as e:
         return jsonify({"erreur": str(e)}), 500
@@ -264,6 +267,45 @@ def _figures_diagnostic(fit, df, dependante, independantes):
     except Exception:
         pass
     return figures
+
+
+@app.route("/exporter_xlsx", methods=["POST"])
+def exporter_xlsx():
+    """Exporte la base nettoyée (celle vraiment utilisée pour l'estimation)
+    en fichier Excel téléchargeable, avec un second onglet listant les
+    sources/liens d'origine de chaque variable — pour que l'étudiant
+    puisse vérifier lui-même qu'aucune donnée n'est inventée."""
+    try:
+        p = request.get_json(force=True)
+        df = pd.DataFrame(p.get("data", []))
+        sources = p.get("sources", [])  # [{variable, source, lien}]
+        stream = io.BytesIO()
+        with pd.ExcelWriter(stream, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Base nettoyée", index=False)
+            if sources:
+                pd.DataFrame(sources).to_excel(writer, sheet_name="Sources", index=False)
+        stream.seek(0)
+        return send_file(stream, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name="base_nettoyee_pain.xlsx")
+    except Exception as e:
+        return jsonify({"erreur": str(e)}), 500
+
+
+@app.route("/variable_dummy", methods=["POST"])
+def variable_dummy():
+    """Transforme une variable continue trop trouée en variable binaire
+    (dummy) par rapport à sa médiane sur les observations disponibles —
+    stratégie de repli scientifiquement défendable quand la variable
+    d'intérêt a trop de données manquantes pour rester continue."""
+    try:
+        p = request.get_json(force=True)
+        df = pd.DataFrame(p.get("data", []))
+        col = p.get("colonne")
+        serie = pd.to_numeric(df[col], errors="coerce")
+        mediane = float(serie.median())
+        df[col] = (serie >= mediane).astype("Int64")
+        return jsonify({"data": df.to_dict("records"), "mediane_utilisee": mediane, "note": f"'{col}' transformée en 0/1 selon le seuil médian {mediane} (1 = au-dessus ou égal à la médiane)."})
+    except Exception as e:
+        return jsonify({"erreur": str(e)}), 500
 
 
 @app.route("/rapport", methods=["POST"])
