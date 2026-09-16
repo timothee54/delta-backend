@@ -1,4 +1,5 @@
-""" Moteur d'estimation de Pain (Delta Infinity) — version étendue.
+"""
+Moteur d'estimation de Pain (Delta Infinity) — version étendue.
 
 Couvre les méthodes QUANTITATIVES du catalogue Pain :
   mco, mcg, logit, probit, gmm (via IV/2SLS), panel (fixe/aléatoire), ardl, sem
@@ -21,6 +22,25 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+
+
+def _nettoyer_nan(obj):
+    """Remplace toute valeur NaN/Infinity par null (None) avant de répondre.
+    Python écrit NaN en toutes lettres dans le JSON par défaut (ex. médiane
+    d'un groupe entièrement vide) — valide en Python, mais pas en JSON
+    standard, donc le navigateur refuse de le lire. On assainit récursivement
+    toutes les réponses pour ne plus jamais renvoyer ça."""
+    if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: _nettoyer_nan(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_nettoyer_nan(v) for v in obj]
+    return obj
+
+
+def jsonify_propre(obj, status=200):
+    return jsonify(_nettoyer_nan(obj)), status
 
 
 def _clean_dataframe(data, colonnes):
@@ -163,11 +183,15 @@ def _sem(data, modele_sem):
     }
 
 
-def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=0.4, colonnes_protegees=None):
+def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=0.4, colonnes_protegees=None, entite_col=None):
     """Nettoyage déterministe et réutilisable (pas généré à la volée) :
     - aligne les séries sur la période commune
-    - interpole les valeurs manquantes isolées (au maximum 1 an d'écart),
-      sinon supprime la ligne si trop de valeurs manquantes
+    - interpole les valeurs manquantes isolées (au maximum 1 an d'écart)
+    - remplace tout ce qui reste manquant par la MÉDIANE de la variable
+      (par entité si entite_col est fourni — ex. par pays en panel — sinon
+      médiane globale), plutôt que de supprimer la ligne : perdre une année
+      entière d'observations coûte souvent plus cher scientifiquement
+      qu'une imputation transparente et signalée
     - signale (sans les supprimer automatiquement) les valeurs aberrantes
       au-delà de 3 écarts-types, pour rester transparent plutôt que de
       décider seul de jeter une observation légitime
@@ -192,13 +216,24 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
     taux_manquant = df[colonnes_valeurs].isna().mean()
     colonnes_ok = [c for c in colonnes_valeurs if c in protegees] + [c for c in controles if taux_manquant[c] <= seuil_manquant]
     colonnes_rejetees = [c for c in controles if c not in colonnes_ok]
-    # Taux de manquant des colonnes protégées, même non rejetées : utile
-    # pour que le site propose une stratégie de repli si la variable
-    # d'intérêt elle-même est trop trouée (dummy, changement de modèle...).
     taux_protegees = {c: round(float(taux_manquant[c]), 3) for c in protegees if c in taux_manquant}
 
     df[colonnes_ok] = df[colonnes_ok].interpolate(method="linear", limit=1, limit_direction="both")
-    df_propre = df.dropna(subset=colonnes_ok)
+
+    imputations = {}
+    for c in colonnes_ok:
+        manquants_avant = int(df[c].isna().sum())
+        if manquants_avant == 0:
+            continue
+        if entite_col and entite_col in df.columns:
+            medianes = df.groupby(entite_col)[c].transform("median")
+            df[c] = df[c].fillna(medianes)
+        # Repli global si toujours manquant (ex. une entité n'a AUCUNE valeur)
+        if df[c].isna().any():
+            df[c] = df[c].fillna(df[c].median())
+        imputations[c] = manquants_avant
+
+    df_propre = df.dropna(subset=colonnes_ok)  # ne devrait plus rien retirer, sauf médiane elle-même indéfinie (colonne 100% vide)
 
     aberrantes = {}
     for c in colonnes_ok:
@@ -212,6 +247,7 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
         "n_avant": len(df), "n_apres": len(df_propre),
         "colonnes_rejetees": colonnes_rejetees,
         "taux_manquant_variables_protegees": taux_protegees,
+        "valeurs_imputees_par_mediane": imputations,
         "valeurs_aberrantes_signalees": aberrantes,
     }
 
@@ -220,10 +256,10 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
 def nettoyer():
     try:
         p = request.get_json(force=True)
-        resultat = _nettoyer_serie(p.get("data", []), p.get("colonnes", []), p.get("periode_col", "annee"), p.get("seuil_manquant", 0.4), p.get("colonnes_protegees"))
-        return jsonify(resultat)
+        resultat = _nettoyer_serie(p.get("data", []), p.get("colonnes", []), p.get("periode_col", "annee"), p.get("seuil_manquant", 0.4), p.get("colonnes_protegees"), p.get("entite_col"))
+        return jsonify_propre(resultat)
     except Exception as e:
-        return jsonify({"erreur": str(e)}), 500
+        return jsonify_propre({"erreur": str(e)}, 500)
 
 
 def _fig_to_base64(fig):
@@ -287,7 +323,7 @@ def exporter_xlsx():
         stream.seek(0)
         return send_file(stream, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name="base_nettoyee_pain.xlsx")
     except Exception as e:
-        return jsonify({"erreur": str(e)}), 500
+        return jsonify_propre({"erreur": str(e)}, 500)
 
 
 @app.route("/variable_dummy", methods=["POST"])
@@ -303,9 +339,9 @@ def variable_dummy():
         serie = pd.to_numeric(df[col], errors="coerce")
         mediane = float(serie.median())
         df[col] = (serie >= mediane).astype("Int64")
-        return jsonify({"data": df.to_dict("records"), "mediane_utilisee": mediane, "note": f"'{col}' transformée en 0/1 selon le seuil médian {mediane} (1 = au-dessus ou égal à la médiane)."})
+        return jsonify_propre({"data": df.to_dict("records"), "mediane_utilisee": mediane, "note": f"'{col}' transformée en 0/1 selon le seuil médian {mediane} (1 = au-dessus ou égal à la médiane)."})
     except Exception as e:
-        return jsonify({"erreur": str(e)}), 500
+        return jsonify_propre({"erreur": str(e)}, 500)
 
 
 @app.route("/rapport", methods=["POST"])
@@ -348,7 +384,7 @@ def rapport():
         stream = io.BytesIO(); doc.save(stream); stream.seek(0)
         return send_file(stream, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document", as_attachment=True, download_name="rapport_pain.docx")
     except Exception as e:
-        return jsonify({"erreur": str(e)}), 500
+        return jsonify_propre({"erreur": str(e)}, 500)
 
 
 @app.route("/videos", methods=["GET"])
@@ -358,15 +394,15 @@ def videos():
     optionnelle : renvoie une liste vide si absente plutôt que d'échouer."""
     key = os.environ.get("YOUTUBE_API_KEY", "")
     if not key:
-        return jsonify({"videos": [], "note": "YOUTUBE_API_KEY non configurée sur Render — fonctionnalité désactivée, pas bloquante."})
+        return jsonify_propre({"videos": [], "note": "YOUTUBE_API_KEY non configurée sur Render — fonctionnalité désactivée, pas bloquante."})
     import requests
     q = request.args.get("q", "")
     try:
         r = requests.get("https://www.googleapis.com/youtube/v3/search", params={"part": "snippet", "q": f"{q} économétrie cours", "type": "video", "maxResults": 5, "key": key}, timeout=8)
         items = r.json().get("items", [])
-        return jsonify({"videos": [{"titre": i["snippet"]["title"], "url": f"https://www.youtube.com/watch?v={i['id']['videoId']}", "vignette": i["snippet"]["thumbnails"]["default"]["url"]} for i in items]})
+        return jsonify_propre({"videos": [{"titre": i["snippet"]["title"], "url": f"https://www.youtube.com/watch?v={i['id']['videoId']}", "vignette": i["snippet"]["thumbnails"]["default"]["url"]} for i in items]})
     except Exception as e:
-        return jsonify({"videos": [], "erreur": str(e)})
+        return jsonify_propre({"videos": [], "erreur": str(e)})
 
 
 @app.route("/estimer", methods=["POST"])
@@ -379,16 +415,16 @@ def estimer():
         data = p.get("data", [])
 
         if methode in ("thematique", "contenu"):
-            return jsonify({"erreur": f"'{methode}' est une analyse qualitative (codage de thèmes/texte), pas un calcul statistique — reste gérée par Pain (Claude) directement, pas par ce moteur."}), 400
+            return jsonify_propre({"erreur": f"'{methode}' est une analyse qualitative (codage de thèmes/texte), pas un calcul statistique — reste gérée par Pain (Claude) directement, pas par ce moteur."}, 400)
         if methode == "plssem":
-            return jsonify({"erreur": "PLS-SEM n'a pas encore de bibliothèque Python fiable/mature intégrée ici (écosystème R plus complet sur ce point). À traiter séparément plus tard."}), 400
+            return jsonify_propre({"erreur": "PLS-SEM n'a pas encore de bibliothèque Python fiable/mature intégrée ici (écosystème R plus complet sur ce point). À traiter séparément plus tard."}, 400)
 
         if methode in ("mco", "mcg", "logit", "probit"):
             if not dependante or not independantes or not data:
-                return jsonify({"erreur": "Champs requis : methode, dependante, independantes, data"}), 400
+                return jsonify_propre({"erreur": "Champs requis : methode, dependante, independantes, data"}, 400)
             df = _clean_dataframe(data, [dependante] + independantes)
             if len(df) < len(independantes) + 2:
-                return jsonify({"erreur": f"Pas assez d'observations valides ({len(df)})."}), 400
+                return jsonify_propre({"erreur": f"Pas assez d'observations valides ({len(df)})."}, 400)
             if methode == "mco": resultat = _mco(df, dependante, independantes)
             elif methode == "mcg": resultat = _mcg(df, dependante, independantes)
             else: resultat = _logit_probit(df, dependante, independantes, "Logit" if methode == "logit" else "Probit")
@@ -406,19 +442,21 @@ def estimer():
             resultat = _sem(data, p.get("modele_sem"))
 
         else:
-            return jsonify({"erreur": f"Méthode '{methode}' inconnue."}), 400
+            return jsonify_propre({"erreur": f"Méthode '{methode}' inconnue."}, 400)
 
-        return jsonify(resultat)
+        return jsonify_propre(resultat)
 
     except Exception as e:
-        return jsonify({"erreur": str(e)}), 500
+        return jsonify_propre({"erreur": str(e)}, 500)
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "Pain — moteur d'estimation", "methodes": ["mco", "mcg", "logit", "probit", "gmm", "panel", "ardl", "sem"]})
+    return jsonify_propre({"status": "ok", "service": "Pain — moteur d'estimation", "methodes": ["mco", "mcg", "logit", "probit", "gmm", "panel", "ardl", "sem"]})
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+
