@@ -132,21 +132,65 @@ def _panel(df, dependante, independantes, entite, periode, effets):
         raise ValueError("Panel nécessite 'entite' et 'periode' (noms de colonnes identifiant individu et temps).")
     from linearmodels.panel import PanelOLS, RandomEffects
     colonnes = [dependante] + independantes + [entite, periode]
-    df2 = _clean_dataframe(df.to_dict("records"), colonnes).set_index([entite, periode])
+    df2 = _clean_dataframe(df.to_dict("records"), colonnes)
+
+    notes_exclusion = []
+
+    # 1. Un pays avec une seule année dans l'échantillon n'apporte aucune
+    # variation utile une fois les effets fixes retirés.
+    effectifs = df2[entite].value_counts()
+    pays_singleton = effectifs[effectifs < 2].index.tolist()
+    if pays_singleton:
+        df2 = df2[~df2[entite].isin(pays_singleton)]
+        notes_exclusion.append(f"Pays exclu(s) (une seule année disponible) : {', '.join(pays_singleton)}.")
+
+    # 2. Un pays qui a 0% de données ORIGINALES pour une variable devient,
+    # après imputation par médiane, CONSTANT sur toute sa période pour
+    # cette variable — une valeur fabriquée, identique chaque année. Une
+    # fois les effets fixes retirés, ce pays contribue alors une colonne de
+    # zéros exacts pour cette variable, ce qui peut casser le rang de la
+    # matrice explicative ("exog does not have full column rank"). On
+    # retire ces pays PAR VARIABLE concernée plutôt que de risquer une
+    # estimation numériquement instable ou un plantage.
+    for var in independantes:
+        variance_par_pays = df2.groupby(entite)[var].nunique()
+        pays_constants = variance_par_pays[variance_par_pays <= 1].index.tolist()
+        if pays_constants and len(pays_constants) < df2[entite].nunique():  # jamais vider tout le panel
+            df2 = df2[~df2[entite].isin(pays_constants)]
+            notes_exclusion.append(f"Pays exclu(s) pour '{var}' (aucune donnée d'origine, valeur imputée constante sur toute la période — pas de variation exploitable avec effets fixes) : {', '.join(pays_constants)}.")
+
+    note_pays_exclus = " ".join(notes_exclusion) if notes_exclusion else None
+
+    df2 = df2.set_index([entite, periode])
     X = sm.add_constant(df2[independantes])
+    note_rang = None
     if effets == "aleatoire":
         fit = RandomEffects(df2[dependante], X).fit()
         nom_methode = "Panel (effets aléatoires)"
     else:
-        fit = PanelOLS(df2[dependante], X, entity_effects=True).fit()
+        try:
+            fit = PanelOLS(df2[dependante], X, entity_effects=True).fit()
+        except ValueError as e:
+            if "full column rank" not in str(e):
+                raise
+            # Dernier recours : une colinéarité reste malgré les exclusions
+            # ci-dessus (ex. deux variables imputées qui varient toujours
+            # exactement ensemble). On le signale sans cacher le problème
+            # plutôt que de planter, mais les coefficients concernés sont à
+            # interpréter avec prudence.
+            fit = PanelOLS(df2[dependante], X, entity_effects=True, check_rank=False).fit()
+            note_rang = "Colinéarité parfaite détectée entre certaines variables explicatives même après retrait des pays à une seule année — l'estimation a quand même été calculée, mais certains coefficients peuvent être numériquement instables. Vérifie si deux variables de contrôle varient toujours ensemble."
         nom_methode = "Panel (effets fixes)"
-    return {
+    resultat = {
         "methode": nom_methode, "n": int(fit.nobs), "r2": round(float(fit.rsquared), 4),
         "coefficients": [
             {"variable": nom, "coefficient": round(float(fit.params[nom]), 4), "erreur_standard": round(float(fit.std_errors[nom]), 4), "p_value": round(float(fit.pvalues[nom]), 4), "significatif_5pct": bool(fit.pvalues[nom] < 0.05)}
             for nom in fit.params.index
         ],
     }
+    if note_pays_exclus: resultat["note_pays_exclus"] = note_pays_exclus
+    if note_rang: resultat["note_colinearite"] = note_rang
+    return resultat
 
 
 def _ardl(df, dependante, independantes, ar_lags, dl_lags):
@@ -220,6 +264,22 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
 
     df[colonnes_ok] = df[colonnes_ok].interpolate(method="linear", limit=1, limit_direction="both")
 
+    # Si une entité (ex. un pays) a 0% de données D'ORIGINE pour une
+    # variable retenue, on l'exclut directement ici plutôt que de lui
+    # fabriquer une valeur constante par médiane globale — cette valeur
+    # n'aurait aucune variation réelle et fausserait toute estimation à
+    # effets fixes par la suite. On ne le fait jamais si ça viderait tout
+    # le jeu de données (variable protégée avec un seul pays disponible,
+    # par exemple).
+    entites_exclues = {}
+    if entite_col and entite_col in df.columns:
+        for c in colonnes_ok:
+            manquant_par_entite = df.groupby(entite_col)[c].apply(lambda s: s.isna().all())
+            vides = manquant_par_entite[manquant_par_entite].index.tolist()
+            if vides and len(vides) < df[entite_col].nunique():
+                df = df[~df[entite_col].isin(vides)]
+                entites_exclues[c] = vides
+
     imputations = {}
     for c in colonnes_ok:
         manquants_avant = int(df[c].isna().sum())
@@ -248,6 +308,7 @@ def _nettoyer_serie(data, colonnes_valeurs, periode_col="annee", seuil_manquant=
         "colonnes_rejetees": colonnes_rejetees,
         "taux_manquant_variables_protegees": taux_protegees,
         "valeurs_imputees_par_mediane": imputations,
+        "entites_exclues_donnees_absentes": entites_exclues,
         "valeurs_aberrantes_signalees": aberrantes,
     }
 
@@ -458,5 +519,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
