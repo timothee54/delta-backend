@@ -17,11 +17,14 @@ import statsmodels.api as sm
 import matplotlib
 matplotlib.use("Agg")  # pas d'écran sur un serveur, indispensable sur Render
 import matplotlib.pyplot as plt
+import logging
+import traceback
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+logging.basicConfig(level=logging.INFO)  # pour que les erreurs ressortent bien dans les logs Render
 
 
 def _nettoyer_nan(obj):
@@ -348,6 +351,7 @@ def nettoyer():
         resultat = _nettoyer_serie(p.get("data", []), p.get("colonnes", []), p.get("periode_col", "annee"), p.get("seuil_manquant", 0.4), p.get("colonnes_protegees"), p.get("entite_col"))
         return jsonify_propre(resultat)
     except Exception as e:
+        app.logger.error("Erreur sur %s :\n%s", request.path, traceback.format_exc())  # visible dans les logs Render, pour diagnostiquer
         return jsonify_propre({"erreur": str(e)}, 500)
 
 
@@ -412,6 +416,7 @@ def exporter_xlsx():
         stream.seek(0)
         return send_file(stream, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name="base_nettoyee_pain.xlsx")
     except Exception as e:
+        app.logger.error("Erreur sur %s :\n%s", request.path, traceback.format_exc())  # visible dans les logs Render, pour diagnostiquer
         return jsonify_propre({"erreur": str(e)}, 500)
 
 
@@ -430,6 +435,7 @@ def variable_dummy():
         df[col] = (serie >= mediane).astype("Int64")
         return jsonify_propre({"data": df.to_dict("records"), "mediane_utilisee": mediane, "note": f"'{col}' transformée en 0/1 selon le seuil médian {mediane} (1 = au-dessus ou égal à la médiane)."})
     except Exception as e:
+        app.logger.error("Erreur sur %s :\n%s", request.path, traceback.format_exc())  # visible dans les logs Render, pour diagnostiquer
         return jsonify_propre({"erreur": str(e)}, 500)
 
 
@@ -473,6 +479,7 @@ def rapport():
         stream = io.BytesIO(); doc.save(stream); stream.seek(0)
         return send_file(stream, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document", as_attachment=True, download_name="rapport_pain.docx")
     except Exception as e:
+        app.logger.error("Erreur sur %s :\n%s", request.path, traceback.format_exc())  # visible dans les logs Render, pour diagnostiquer
         return jsonify_propre({"erreur": str(e)}, 500)
 
 
@@ -553,6 +560,7 @@ def estimer():
         return jsonify_propre(resultat)
 
     except Exception as e:
+        app.logger.error("Erreur sur %s :\n%s", request.path, traceback.format_exc())  # visible dans les logs Render, pour diagnostiquer
         return jsonify_propre({"erreur": str(e)}, 500)
 
 
