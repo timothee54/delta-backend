@@ -43,6 +43,34 @@ def jsonify_propre(obj, status=200):
     return jsonify(_nettoyer_nan(obj)), status
 
 
+def _dedupliquer_variables(dependante, independantes):
+    """Enlève les doublons de noms dans les variables explicatives (en
+    conservant l'ordre), et vérifie que la variable dépendante n'y figure
+    pas aussi. Un nom en double dans `independantes` ferait choisir deux
+    fois la même colonne (`df[independantes]`), ce qui donne à statsmodels
+    une colonne dupliquée dans la matrice explicative : l'index des
+    résultats (`fit.params`) contient alors ce nom deux fois, et
+    `float(fit.params[nom])` échoue avec un message cryptique ("only
+    length-1 arrays can be converted to Python scalars") au lieu d'un
+    message clair. On corrige ça ici, une fois pour toutes, avant tout
+    calcul."""
+    vus = set()
+    propres = []
+    doublons = []
+    for v in independantes:
+        if v in vus:
+            doublons.append(v)
+            continue
+        vus.add(v)
+        propres.append(v)
+    if dependante in propres:
+        raise ValueError(
+            f"« {dependante} » est à la fois la variable dépendante et une variable explicative : "
+            "retire-la de la liste des variables de contrôle/explicatives."
+        )
+    return propres, doublons
+
+
 def _clean_dataframe(data, colonnes):
     df = pd.DataFrame(data)
     for c in colonnes:
@@ -480,6 +508,18 @@ def estimer():
         if methode == "plssem":
             return jsonify_propre({"erreur": "PLS-SEM n'a pas encore de bibliothèque Python fiable/mature intégrée ici (écosystème R plus complet sur ce point). À traiter séparément plus tard."}, 400)
 
+        # Sécurité : un nom de variable en double dans `independantes` (ou
+        # partagé avec `dependante`) fait planter le calcul plus loin avec
+        # un message incompréhensible ("only length-1 arrays..."). On le
+        # nettoie ici, une bonne fois, pour TOUTES les méthodes.
+        if dependante and independantes:
+            try:
+                independantes, doublons = _dedupliquer_variables(dependante, independantes)
+            except ValueError as e:
+                return jsonify_propre({"erreur": str(e)}, 400)
+        else:
+            doublons = []
+
         if methode in ("mco", "mcg", "logit", "probit"):
             if not dependante or not independantes or not data:
                 return jsonify_propre({"erreur": "Champs requis : methode, dependante, independantes, data"}, 400)
@@ -504,6 +544,11 @@ def estimer():
 
         else:
             return jsonify_propre({"erreur": f"Méthode '{methode}' inconnue."}, 400)
+
+        if doublons:
+            resultat["note_variables_dupliquees"] = (
+                f"Variable(s) listée(s) en double dans les variables explicatives, gardée(s) une seule fois automatiquement : {', '.join(sorted(set(doublons)))}."
+            )
 
         return jsonify_propre(resultat)
 
