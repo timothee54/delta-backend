@@ -212,9 +212,26 @@ def _panel(df, dependante, independantes, entite, periode, effets):
     for var in independantes:
         variance_par_pays = df2.groupby(entite)[var].nunique()
         pays_constants = variance_par_pays[variance_par_pays <= 1].index.tolist()
-        if pays_constants and len(pays_constants) < df2[entite].nunique():  # jamais vider tout le panel
+        # On ne retire un pays que s'il en reste au MOINS DEUX ensuite : un
+        # panel à effets fixes avec un seul pays n'a plus de sens
+        # mathématiquement (les effets fixes se confondent avec la
+        # constante), et fait planter le calcul plus loin avec une erreur
+        # cryptique ("division by zero"). Si le retrait ferait tomber à un
+        # seul pays, on garde ce pays et on prévient à la place — c'est
+        # souvent un vrai zéro (ex. pas encore de production pétrolière),
+        # pas une valeur fabriquée, donc mieux vaut la conserver que de
+        # perdre tout le panel.
+        if pays_constants and (df2[entite].nunique() - len(pays_constants)) >= 2:
             df2 = df2[~df2[entite].isin(pays_constants)]
             notes_exclusion.append(f"Pays exclu(s) pour '{var}' (aucune donnée d'origine, valeur imputée constante sur toute la période — pas de variation exploitable avec effets fixes) : {', '.join(pays_constants)}.")
+        elif pays_constants:
+            notes_exclusion.append(f"'{var}' sans variation pour {', '.join(pays_constants)}, mais conservé(s) dans le panel : les retirer laisserait moins de deux pays, ce qui rendrait l'estimation à effets fixes impossible. Interprète le coefficient de cette variable avec prudence.")
+
+    if effets != "aleatoire" and df2[entite].nunique() < 2:
+        raise ValueError(
+            "Il ne reste plus assez de pays pour une estimation en panel à effets fixes (minimum 2) après le nettoyage. "
+            "Retire ou remplace la variable la plus incomplète, choisis les effets aléatoires, ou utilise une méthode sans effets fixes (ex. MCO)."
+        )
 
     note_pays_exclus = " ".join(notes_exclusion) if notes_exclusion else None
 
