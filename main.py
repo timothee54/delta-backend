@@ -89,12 +89,22 @@ def _retirer_colonnes_constantes(df, independantes):
     return restantes, constantes
 
 
-def _clean_dataframe(data, colonnes):
+def _clean_dataframe(data, colonnes, colonnes_texte=None):
+    """colonnes_texte : colonnes à laisser TELLES QUELLES (texte), par
+    exemple l'identifiant de pays dans un panel. Les convertir en nombre
+    comme les autres les transformerait TOUTES en valeur manquante (ex.
+    "Cameroun" n'est pas un nombre) ; comme cette colonne sert ensuite au
+    dropna, ça viderait silencieusement TOUT le jeu de données — c'était
+    la vraie cause des erreurs en cascade ("only length-1 arrays",
+    "division by zero", "moins de deux pays") sur les estimations en
+    panel : le panel était vide avant même de commencer le calcul."""
     df = pd.DataFrame(data)
+    colonnes_texte = set(colonnes_texte or [])
     for c in colonnes:
         if c not in df.columns:
             raise ValueError(f"Colonne manquante dans les données : {c}")
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        if c not in colonnes_texte:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(subset=colonnes)
 
 
@@ -189,7 +199,7 @@ def _panel(df, dependante, independantes, entite, periode, effets):
         raise ValueError("Panel nécessite 'entite' et 'periode' (noms de colonnes identifiant individu et temps).")
     from linearmodels.panel import PanelOLS, RandomEffects
     colonnes = [dependante] + independantes + [entite, periode]
-    df2 = _clean_dataframe(df.to_dict("records"), colonnes)
+    df2 = _clean_dataframe(df.to_dict("records"), colonnes, colonnes_texte=[entite])
 
     notes_exclusion = []
 
