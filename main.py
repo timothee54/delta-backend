@@ -74,6 +74,21 @@ def _dedupliquer_variables(dependante, independantes):
     return propres, doublons
 
 
+def _retirer_colonnes_constantes(df, independantes):
+    """Retire les variables de contrôle qui n'ont plus AUCUNE variation sur
+    les observations qui vont réellement servir au calcul (après nettoyage,
+    et après d'éventuelles exclusions de pays pour un panel). Une variable
+    constante n'a pas de coefficient estimable ; pire, si sa valeur
+    constante vaut 1, elle entre en collision avec la constante que le
+    modèle ajoute automatiquement et fait planter la bibliothèque
+    statistique avec un message incompréhensible ("only length-1 arrays
+    can be converted to Python scalars"). On la retire proprement avant
+    que ça arrive, et on le signale."""
+    constantes = [v for v in independantes if v in df.columns and df[v].nunique(dropna=True) <= 1]
+    restantes = [v for v in independantes if v not in constantes]
+    return restantes, constantes
+
+
 def _clean_dataframe(data, colonnes):
     df = pd.DataFrame(data)
     for c in colonnes:
@@ -97,19 +112,23 @@ def _coeffs_depuis_fit(fit, noms):
 
 
 def _mco(df, dependante, independantes):
+    independantes, constantes = _retirer_colonnes_constantes(df, independantes)
     X = sm.add_constant(df[independantes]); y = df[dependante]
     fit = sm.OLS(y, X).fit()
-    return {
+    resultat = {
         "methode": "MCO (moindres carrés ordinaires)",
         "n": int(fit.nobs), "r2": round(float(fit.rsquared), 4), "r2_ajuste": round(float(fit.rsquared_adj), 4),
         "coefficients": _coeffs_depuis_fit(fit, ["const"] + independantes),
         "figures": _figures_diagnostic(fit, df, dependante, independantes),
     }
+    if constantes: resultat["note_variables_constantes"] = f"Variable(s) sans aucune variation sur les données retenues, retirée(s) automatiquement : {', '.join(constantes)}."
+    return resultat
 
 
 def _mcg(df, dependante, independantes):
     # FGLS en 2 étapes : corrige l'hétéroscédasticité en pondérant par
     # l'inverse de la variance estimée des résidus MCO.
+    independantes, constantes = _retirer_colonnes_constantes(df, independantes)
     X = sm.add_constant(df[independantes]); y = df[dependante]
     ols_fit = sm.OLS(y, X).fit()
     resid2 = ols_fit.resid ** 2
@@ -120,7 +139,7 @@ def _mcg(df, dependante, independantes):
         "methode": "MCG (moindres carrés généralisés, FGLS 2 étapes)",
         "n": int(fit.nobs), "r2": round(float(fit.rsquared), 4), "r2_ajuste": round(float(fit.rsquared_adj), 4),
         "coefficients": _coeffs_depuis_fit(fit, ["const"] + independantes),
-        "note": "Pondération estimée automatiquement à partir de la variance des résidus MCO (FGLS en 2 étapes).",
+        "note": "Pondération estimée automatiquement à partir de la variance des résidus MCO (FGLS en 2 étapes)." + (f" Variable(s) sans variation retirée(s) : {', '.join(constantes)}." if constantes else ""),
     }
 
 
@@ -128,13 +147,16 @@ def _logit_probit(df, dependante, independantes, modele):
     y = df[dependante]
     if not set(y.unique()).issubset({0, 1}):
         raise ValueError(f"La variable dépendante doit être binaire (0/1) pour un {modele}.")
+    independantes, constantes = _retirer_colonnes_constantes(df, independantes)
     X = sm.add_constant(df[independantes])
     fit = (sm.Logit(y, X) if modele == "Logit" else sm.Probit(y, X)).fit(disp=0)
-    return {
+    resultat = {
         "methode": modele, "n": int(fit.nobs), "pseudo_r2": round(float(fit.prsquared), 4),
         "coefficients": _coeffs_depuis_fit(fit, ["const"] + independantes),
         "figures": _figures_diagnostic(fit, df, dependante, independantes),
     }
+    if constantes: resultat["note_variables_constantes"] = f"Variable(s) sans aucune variation sur les données retenues, retirée(s) automatiquement : {', '.join(constantes)}."
+    return resultat
 
 
 def _gmm(df, dependante, independantes, instruments):
@@ -145,17 +167,21 @@ def _gmm(df, dependante, independantes, instruments):
     from linearmodels.iv import IV2SLS
     colonnes = [dependante] + independantes + instruments
     df2 = _clean_dataframe(df.to_dict("records"), colonnes)
+    exogenes0 = [v for v in independantes if v not in instruments]
+    exogenes0, constantes = _retirer_colonnes_constantes(df2, exogenes0)
+    independantes = exogenes0 + [v for v in independantes if v in instruments]
     endogenes = [v for v in independantes if v in instruments] or independantes[:1]
     exogenes = [v for v in independantes if v not in endogenes]
     fit = IV2SLS(df2[dependante], sm.add_constant(df2[exogenes]) if exogenes else None, df2[endogenes], df2[instruments]).fit()
-    return {
+    resultat = {
         "methode": "GMM / Variables instrumentales (2SLS)", "n": int(fit.nobs),
         "coefficients": [
             {"variable": nom, "coefficient": round(float(fit.params[nom]), 4), "erreur_standard": round(float(fit.std_errors[nom]), 4), "p_value": round(float(fit.pvalues[nom]), 4), "significatif_5pct": bool(fit.pvalues[nom] < 0.05)}
             for nom in fit.params.index
         ],
-        "note": "GMM implémenté ici via 2SLS (cas le plus courant en pratique). Un vrai GMM multi-moments généralisé pourra être ajouté plus tard si un cas précis l'exige.",
+        "note": "GMM implémenté ici via 2SLS (cas le plus courant en pratique). Un vrai GMM multi-moments généralisé pourra être ajouté plus tard si un cas précis l'exige." + (f" Variable(s) sans variation retirée(s) : {', '.join(constantes)}." if constantes else ""),
     }
+    return resultat
 
 
 def _panel(df, dependante, independantes, entite, periode, effets):
@@ -192,6 +218,10 @@ def _panel(df, dependante, independantes, entite, periode, effets):
 
     note_pays_exclus = " ".join(notes_exclusion) if notes_exclusion else None
 
+    independantes, constantes = _retirer_colonnes_constantes(df2, independantes)
+    if constantes:
+        notes_exclusion.append(f"Variable(s) sans aucune variation sur les pays/années retenus, retirée(s) automatiquement : {', '.join(constantes)}.")
+        note_pays_exclus = " ".join(notes_exclusion) if notes_exclusion else None
     df2 = df2.set_index([entite, periode])
     X = sm.add_constant(df2[independantes])
     note_rang = None
@@ -228,16 +258,19 @@ def _ardl(df, dependante, independantes, ar_lags, dl_lags):
     from statsmodels.tsa.ardl import ARDL
     colonnes = [dependante] + independantes
     df2 = _clean_dataframe(df.to_dict("records"), colonnes).reset_index(drop=True)
+    independantes, constantes = _retirer_colonnes_constantes(df2, independantes)
     lags_dict = {v: dl_lags or 1 for v in independantes}
     fit = ARDL(df2[dependante], lags=ar_lags or 1, exog=df2[independantes], order=lags_dict).fit()
     noms = list(fit.params.index)
+    note = "AR lags et DL lags par défaut à 1 si non précisés — à ajuster selon les critères d'information (AIC/BIC) pour un vrai travail académique."
+    if constantes: note += f" Variable(s) sans variation retirée(s) : {', '.join(constantes)}."
     return {
         "methode": f"ARDL({ar_lags or 1})", "n": int(fit.nobs),
         "coefficients": [
             {"variable": nom, "coefficient": round(float(fit.params[nom]), 4), "erreur_standard": round(float(fit.bse[nom]), 4), "p_value": round(float(fit.pvalues[nom]), 4), "significatif_5pct": bool(fit.pvalues[nom] < 0.05)}
             for nom in noms
         ],
-        "note": "AR lags et DL lags par défaut à 1 si non précisés — à ajuster selon les critères d'information (AIC/BIC) pour un vrai travail académique.",
+        "note": note,
     }
 
 
